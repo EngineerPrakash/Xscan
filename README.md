@@ -15,11 +15,11 @@ Then drop your scan **folder** onto the page (or use *Open folder…* / *Open fi
 ### What it opens
 | Format | Notes |
 |---|---|
-| **DICOM** | Folder of slices (extension-less files and `DICOMDIR` are fine), loose `.dcm`, multi-frame files, or a `.zip` of them. Uncompressed, deflated or baseline-JPEG transfer syntaxes. Slices are sorted by position; if the export has several series you can pick one. |
+| **DICOM** | Folder of slices (extension-less files and `DICOMDIR` are fine), loose `.dcm`, multi-frame files, or a `.zip` of them. Uncompressed, deflated, baseline-JPEG or **JPEG-Lossless** (the usual dental CBCT export) transfer syntaxes. Slices are sorted by position; if the export has several series you can pick one. |
 | **NIfTI** | `.nii`, `.nii.gz` (orientation assumed RAS) |
 | **PNG / JPG** | Panoramic / bitewing exports, shown as a flat image |
 
-Not supported yet: DICOM compressed with JPEG-Lossless, JPEG 2000, JPEG-LS or RLE. If you hit that, ask the clinic for an *uncompressed* export or convert with 3D Slicer / Horos / `dcmdjpeg`.
+Not supported yet: DICOM compressed with JPEG 2000, JPEG-LS or RLE. If you hit that, ask the clinic for an *uncompressed* export or convert with 3D Slicer / Horos / `dcmdjpeg`.
 
 ### Features
 - **3D**: *Surface* (shaded bone/teeth with adjustable threshold – peel from skin to bone to teeth/implants), *X-ray* (simulated radiograph you can rotate), *MIP*; crop/cut-away, preset views, PNG snapshot.
@@ -29,6 +29,7 @@ Not supported yet: DICOM compressed with JPEG-Lossless, JPEG 2000, JPEG-LS or RL
 ```
 index.html          page
 css/style.css
+js/jpegll.js        JPEG-Lossless decoder
 js/loaders.js       DICOM / NIfTI / zip / image parsing
 js/volume.js        stats, GPU-sized resampling, demo phantom
 js/renderer.js      WebGL2 ray-caster + orbit camera

@@ -1,16 +1,20 @@
 #!/usr/bin/env node
 /* Writes the built-in demo phantom as a folder of uncompressed DICOM slices (one file per slice,
  * extension-less, like a typical dental CD export) so the DICOM loading path can be tried/tested.
- *   node tools/make-test-dicom.js out_dir [--multiframe] */
+ *   node tools/make-test-dicom.js out_dir [--multiframe] [--jpegll]
+ * --jpegll stores slices JPEG-Lossless compressed (transfer syntax 1.2.840.10008.1.2.4.70) and verifies
+ * that js/jpegll.js decodes them back bit-exactly. */
 'use strict';
 const fs = require('fs');
 const path = require('path');
 global.window = global;
 require('../js/volume.js');
+require('../js/jpegll.js');
 const vol = global.Xscan.makePhantom();
 const [nx, ny, nz] = vol.dims;
 const out = process.argv[2] || 'test-dicom';
 const multi = process.argv.includes('--multiframe');
+const ll = process.argv.includes('--jpegll');
 fs.mkdirSync(out, { recursive: true });
 
 const pad = (b, ch) => (b.length % 2 ? Buffer.concat([b, Buffer.from([ch])]) : b);
@@ -28,10 +32,47 @@ const uid = (s) => s;
 const SOP = '1.2.840.10008.5.1.4.1.1.2';
 const series = '1.2.826.0.1.3680043.8.498.1';
 
-function file(sopInst, extra, pixelBytes, frames) {
+// Minimal lossless JPEG encoder (one 16-bit component, fixed 5-bit Huffman code for categories 0..16)
+function encodeLossless(u16, W, H, sel, pt) {
+  const out = [];
+  const w16 = (v) => out.push(v >> 8, v & 255);
+  out.push(0xff, 0xd8);
+  out.push(0xff, 0xc3); w16(11); out.push(16); w16(H); w16(W); out.push(1, 1, 0x11, 0);
+  out.push(0xff, 0xc4); w16(2 + 1 + 16 + 17); out.push(0x00);
+  for (let i = 1; i <= 16; i++) out.push(i === 5 ? 17 : 0);
+  for (let i = 0; i < 17; i++) out.push(i);
+  out.push(0xff, 0xda); w16(8); out.push(1, 1, 0x00, sel, 0, pt);
+  let acc = 0, nb = 0;
+  const put = (v, n) => {
+    for (let i = n - 1; i >= 0; i--) {
+      acc = (acc << 1) | ((v >> i) & 1); nb++;
+      if (nb === 8) { out.push(acc); if (acc === 0xff) out.push(0); acc = 0; nb = 0; }
+    }
+  };
+  const px = (y, x) => u16[y * W + x] >> pt;
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    let pred;
+    if (y === 0 && x === 0) pred = 1 << (15 - pt);
+    else if (y === 0) pred = px(y, x - 1);
+    else if (x === 0) pred = px(y - 1, x);
+    else {
+      const a = px(y, x - 1), b = px(y - 1, x), c = px(y - 1, x - 1);
+      pred = [0, a, b, c, a + b - c, a + ((b - c) >> 1), b + ((a - c) >> 1), (a + b) >> 1][sel];
+    }
+    let d = ((px(y, x) - pred) << 16) >> 16; // wrap to int16
+    const s = d === -32768 ? 16 : d === 0 ? 0 : 32 - Math.clz32(Math.abs(d));
+    put(s, 5); // canonical code i for symbol i, all length 5
+    if (s && s < 16) put(d < 0 ? d - 1 : d, s);
+  }
+  while (nb) put(1, 1); // pad with 1 bits
+  out.push(0xff, 0xd9);
+  return Buffer.from(out);
+}
+
+function file(sopInst, extra, pixelBytes, frames, tsUid, pixelEl) {
   const meta = Buffer.concat([
     el(2, 1, 'OB', Buffer.from([0, 1])),
-    el(2, 2, 'UI', SOP), el(2, 3, 'UI', sopInst), el(2, 0x10, 'UI', '1.2.840.10008.1.2.1')
+    el(2, 2, 'UI', SOP), el(2, 3, 'UI', sopInst), el(2, 0x10, 'UI', tsUid || '1.2.840.10008.1.2.1')
   ]);
   const gl = el(2, 0, 'UL', (() => { const b = Buffer.alloc(4); b.writeUInt32LE(meta.length); return b; })());
   const ds = Buffer.concat([
@@ -45,7 +86,7 @@ function file(sopInst, extra, pixelBytes, frames) {
     el(0x28, 0x30, 'DS', '0.4\\0.4'),
     el(0x28, 0x100, 'US', us(16)), el(0x28, 0x101, 'US', us(16)), el(0x28, 0x102, 'US', us(15)), el(0x28, 0x103, 'US', us(1)),
     el(0x28, 0x1052, 'DS', '0'), el(0x28, 0x1053, 'DS', '1'),
-    el(0x7fe0, 0x10, 'OW', pixelBytes)
+    pixelEl || el(0x7fe0, 0x10, 'OW', pixelBytes)
   ]);
   return Buffer.concat([Buffer.alloc(128), Buffer.from('DICM'), gl, meta, ds]);
 }
@@ -59,13 +100,31 @@ if (multi) {
   fs.writeFileSync(path.join(out, 'multiframe.dcm'), f);
 } else {
   // write in shuffled order with instance numbers to prove sorting by position works
+  const encap = (frag) => {
+    const f = pad(frag, 0);
+    const hdr = Buffer.alloc(12 + 8);
+    hdr.writeUInt16LE(0x7fe0, 0); hdr.writeUInt16LE(0x10, 2); hdr.write('OB', 4, 'latin1'); hdr.writeUInt32LE(0xffffffff, 8);
+    hdr.writeUInt16LE(0xfffe, 12); hdr.writeUInt16LE(0xe000, 14); hdr.writeUInt32LE(0, 16); // empty offset table
+    const item = Buffer.alloc(8); item.writeUInt16LE(0xfffe, 0); item.writeUInt16LE(0xe000, 2); item.writeUInt32LE(f.length, 4);
+    const end = Buffer.alloc(8); end.writeUInt16LE(0xfffe, 0); end.writeUInt16LE(0xe0dd, 2);
+    return Buffer.concat([hdr, item, f, end]);
+  };
   for (let k = 0; k < nz; k++) {
     const z = k * 0.4;
     const f = file('1.2.826.0.1.3680043.8.498.1.' + (k + 1), {
       pre: [el(0x18, 0x50, 'DS', '0.4')],
       mid: [el(0x20, 0x13, 'IS', String(nz - k)), el(0x20, 0x32, 'DS', `-40\\-40\\${z.toFixed(2)}`), el(0x20, 0x37, 'DS', '1\\0\\0\\0\\1\\0')]
-    }, slice(k));
+    }, slice(k), 0, ll ? '1.2.840.10008.1.2.4.70' : undefined,
+    ll ? encap(encodeLossless(new Uint16Array(slice(k).buffer.slice(slice(k).byteOffset, slice(k).byteOffset + nx * ny * 2)), nx, ny, [1, 4, 6, 7][k % 4], k % 3 === 0 ? 1 : 0)) : undefined);
     fs.writeFileSync(path.join(out, 'IM' + String(k).padStart(5, '0')), f);
   }
+}
+if (ll) { // verify roundtrip of every predictor / point transform
+  for (let sel = 1; sel <= 7; sel++) for (const pt of [0, 1]) {
+    const src = new Uint16Array(vol.data.buffer.slice(75 * nx * ny * 2, 76 * nx * ny * 2)).map((v) => (pt ? v & 0xfffe : v));
+    const dec = global.Xscan.decodeJpegLossless(encodeLossless(src, nx, ny, sel, pt));
+    if (dec.data.length !== src.length || dec.data.some((v, i) => v !== src[i])) throw new Error('lossless roundtrip FAILED sel=' + sel + ' pt=' + pt);
+  }
+  console.log('jpeg-lossless roundtrip OK (predictors 1-7, point transform 0/1)');
 }
 console.log('wrote', multi ? 'multiframe.dcm' : nz + ' slices', 'to', out);

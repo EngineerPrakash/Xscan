@@ -13,7 +13,9 @@
     EXPLICIT_LE: '1.2.840.10008.1.2.1',
     DEFLATED: '1.2.840.10008.1.2.1.99',
     EXPLICIT_BE: '1.2.840.10008.1.2.2',
-    JPEG_BASELINE: '1.2.840.10008.1.2.4.50'
+    JPEG_BASELINE: '1.2.840.10008.1.2.4.50',
+    JPEG_LOSSLESS: '1.2.840.10008.1.2.4.70',
+    JPEG_LOSSLESS_P14: '1.2.840.10008.1.2.4.57'
   };
 
   const tick = () => new Promise((r) => setTimeout(r, 0));
@@ -161,11 +163,29 @@
 
   function unsupportedTransferSyntax(ts) {
     const names = {
-      '1.2.840.10008.1.2.4.70': 'JPEG Lossless', '1.2.840.10008.1.2.4.57': 'JPEG Lossless',
       '1.2.840.10008.1.2.4.90': 'JPEG 2000', '1.2.840.10008.1.2.4.91': 'JPEG 2000',
       '1.2.840.10008.1.2.5': 'RLE', '1.2.840.10008.1.2.4.80': 'JPEG-LS', '1.2.840.10008.1.2.4.81': 'JPEG-LS'
     };
     return names[ts] || ts;
+  }
+
+  /** Bytes of one compressed frame from encapsulated pixel data (handles multi-fragment frames). */
+  function encapsulatedFrame(rec, frame) {
+    const el = rec.pixel;
+    const frags = el.fragments || [];
+    const bytes = rec.ds.byteArray;
+    const part = (f) => bytes.subarray(f.position, f.position + f.length);
+    let list;
+    if (rec.frames === 1) list = frags;
+    else if (frags.length === rec.frames) list = [frags[frame]];
+    else return global.dicomParser.readEncapsulatedImageFrame(rec.ds, el, frame);
+    if (!list.length) throw new Error('No compressed pixel data in ' + rec.name);
+    if (list.length === 1) return part(list[0]);
+    const total = list.reduce((a, f) => a + f.length, 0);
+    const out = new Uint8Array(total);
+    let o = 0;
+    for (const f of list) { out.set(part(f), o); o += f.length; }
+    return out;
   }
 
   /** Get raw pixel samples for one frame of a record as a typed array (8/16 bit). */
@@ -173,7 +193,7 @@
     const { ts, rows, cols, bitsAllocated, pixelRep, spp } = rec;
     const n = rows * cols;
     if (ts === TS.JPEG_BASELINE) {
-      const jpg = global.dicomParser.readEncapsulatedImageFrame(rec.ds, rec.pixel, frame);
+      const jpg = encapsulatedFrame(rec, frame);
       const bmp = await createImageBitmap(new Blob([jpg], { type: 'image/jpeg' }));
       const c = document.createElement('canvas');
       c.width = cols; c.height = rows;
@@ -183,6 +203,18 @@
       const out = new Uint8Array(n);
       for (let i = 0; i < n; i++) out[i] = d[i * 4];
       return out;
+    }
+    if (ts === TS.JPEG_LOSSLESS || ts === TS.JPEG_LOSSLESS_P14) {
+      const img = X.decodeJpegLossless(encapsulatedFrame(rec, frame));
+      if (img.width !== cols || img.height !== rows) throw new Error('Decoded image size does not match DICOM header in ' + rec.name);
+      let arr = img.data;
+      if (img.components === 3 || spp === 3) {
+        const g = new Uint8Array(n);
+        for (let i = 0; i < n; i++) g[i] = (arr[i * 3] * 0.299 + arr[i * 3 + 1] * 0.587 + arr[i * 3 + 2] * 0.114) | 0;
+        return g;
+      }
+      if (bitsAllocated === 8) return Uint8Array.from(arr);
+      return pixelRep ? new Int16Array(arr.buffer, arr.byteOffset, arr.length) : arr;
     }
     if (ts !== TS.IMPLICIT_LE && ts !== TS.EXPLICIT_LE && ts !== TS.DEFLATED) {
       throw new Error('This scan is compressed with ' + unsupportedTransferSyntax(ts) +
